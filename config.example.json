@@ -1,0 +1,12 @@
+{
+  "codexCommand": "codex.cmd",
+  "project": {
+    "id": "codex-phone",
+    "name": "Codex-Phone",
+    "path": "C:\\Users\\90511\\Desktop\\Codex-Phone"
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 5179
+  }
+}
