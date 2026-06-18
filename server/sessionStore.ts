@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { db } from "./db.js";
-import type { AppConfig, PermissionMode } from "./types.js";
+import type { PermissionMode, ProjectConfig } from "./types.js";
 
 export type SessionRecord = {
   id: string;
@@ -74,7 +74,7 @@ function toMessage(row: MessageRow): StoredMessage {
   };
 }
 
-export function ensureProject(project: AppConfig["project"]) {
+export function ensureProject(project: ProjectConfig) {
   const timestamp = now();
   db.prepare(
     `
@@ -146,7 +146,7 @@ export function getSession(sessionId: string) {
 }
 
 export function getOrCreateActiveSession(projectId: string) {
-  const activeId = getActiveSessionId();
+  const activeId = getActiveSessionId(projectId);
   if (activeId) {
     const active = getSession(activeId);
     if (active?.projectId === projectId) {
@@ -164,17 +164,39 @@ export function getOrCreateActiveSession(projectId: string) {
 }
 
 export function setActiveSessionId(sessionId: string) {
+  const session = getSession(sessionId);
+  if (!session) {
+    return;
+  }
+
   db.prepare(
     `
     INSERT INTO app_state (key, value)
-    VALUES ('active_session_id', ?)
+    VALUES (?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `
-  ).run(sessionId);
+  ).run(`active_session_id:${session.projectId}`, sessionId);
 }
 
-export function getActiveSessionId() {
-  const row = db.prepare("SELECT value FROM app_state WHERE key = 'active_session_id'").get() as
+export function getActiveSessionId(projectId: string) {
+  const row = db.prepare("SELECT value FROM app_state WHERE key = ?").get(`active_session_id:${projectId}`) as
+    | { value: string }
+    | undefined;
+  return row?.value ?? null;
+}
+
+export function setActiveProjectId(projectId: string) {
+  db.prepare(
+    `
+    INSERT INTO app_state (key, value)
+    VALUES ('active_project_id', ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `
+  ).run(projectId);
+}
+
+export function getActiveProjectId() {
+  const row = db.prepare("SELECT value FROM app_state WHERE key = 'active_project_id'").get() as
     | { value: string }
     | undefined;
   return row?.value ?? null;
@@ -197,6 +219,28 @@ export function updateSessionTitleFromMessage(sessionId: string, message: string
   const compact = message.replace(/\s+/g, " ").trim();
   const title = compact.length > 20 ? `${compact.slice(0, 20)}...` : compact || "新会话";
   db.prepare("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?").run(title, now(), sessionId);
+}
+
+export function renameSession(sessionId: string, title: string) {
+  const compact = title.replace(/\s+/g, " ").trim();
+  if (!compact) {
+    return null;
+  }
+
+  const session = getSession(sessionId);
+  if (!session) {
+    return null;
+  }
+
+  const nextTitle = compact.length > 80 ? compact.slice(0, 80) : compact;
+  const timestamp = now();
+  db.prepare("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?").run(nextTitle, timestamp, sessionId);
+
+  return {
+    ...session,
+    title: nextTitle,
+    updatedAt: timestamp
+  };
 }
 
 export function archiveSession(sessionId: string) {

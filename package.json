@@ -1,12 +1,19 @@
 {
   "name": "codex-phone",
   "version": "0.1.0",
+  "description": "Codex Phone desktop tray app",
+  "author": "XiaoQi",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "tsx server/index.ts",
     "build": "tsc --noEmit && vite build",
-    "preview": "cross-env NODE_ENV=production tsx server/index.ts"
+    "preview": "cross-env NODE_ENV=production tsx server/index.ts",
+    "build:main": "tsc -p tsconfig.main.json",
+    "build:icon": "tsx scripts/build-icon.ts",
+    "rebuild:electron": "electron-rebuild -f -w better-sqlite3",
+    "electron:dev": "npm run build:icon && npm run build && npm run build:main && electron .",
+    "dist": "npm run build:icon && npm run build && npm run build:main && npm run rebuild:electron && tsx scripts/package-windows.ts"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",
@@ -25,7 +32,43 @@
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
     "@types/ws": "^8.18.1",
+    "electron": "^35.7.4",
+    "electron-builder": "^25.1.8",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
+  },
+  "main": "dist/main/desktop/main.cjs",
+  "build": {
+    "appId": "com.codexphone.app",
+    "productName": "Codex Phone",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/main/**/*",
+      "dist/web/**/*",
+      "config.example.json",
+      "README.md"
+    ],
+    "extraResources": [
+      {
+        "from": "config.json",
+        "to": "config.json"
+      },
+      {
+        "from": "build",
+        "to": "build"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false
+    }
   }
 }

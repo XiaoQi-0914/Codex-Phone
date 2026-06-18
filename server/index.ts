@@ -12,27 +12,35 @@ import {
   ensureProject,
   finishRun,
   getOrCreateActiveSession,
+  getActiveProjectId,
   getSession,
   listMessages,
   listSessions,
+  renameSession,
   setActiveSessionId,
+  setActiveProjectId,
   updateSessionThreadId,
   updateSessionTitleFromMessage
 } from "./sessionStore.js";
 import type { ClientMessage, PermissionMode, RunStatus, ServerMessage } from "./types.js";
 
-const config = await loadConfig();
-ensureProject(config.project);
+let config = await loadConfig();
+let projects = config.projects;
+for (const project of projects) {
+  ensureProject(project);
+}
 const app = express();
 const codexCommand = config.codexCommand ?? (process.platform === "win32" ? "codex.cmd" : "codex");
+let projectById = new Map(projects.map((project) => [project.id, project]));
+const baseDir = path.resolve(process.env.CODEX_PHONE_BASE_DIR ?? process.cwd());
 
-const webRoot = path.resolve(process.cwd(), "web");
+const webRoot = path.resolve(baseDir, "web");
 const isProduction = process.env.NODE_ENV === "production";
 
 if (isProduction) {
-  const distRoot = path.resolve(process.cwd(), "dist/web");
+  const distRoot = path.resolve(baseDir, "dist/web");
   app.use(express.static(distRoot));
-  app.get("*", (_req, res) => {
+  app.use((_req, res) => {
     res.sendFile(path.join(distRoot, "index.html"));
   });
 } else {
@@ -48,18 +56,28 @@ if (isProduction) {
 
 const server = app.listen(config.server.port, config.server.host, () => {
   console.log(`Codex Phone is running at http://${config.server.host}:${config.server.port}`);
-  console.log(`Project: ${config.project.name} (${config.project.path})`);
+  console.log(`Projects: ${projects.map((project) => `${project.name} (${project.path})`).join(", ")}`);
   console.log(`Codex command: ${codexCommand}`);
 });
 
 const wss = new WebSocketServer({ server, path: "/ws" });
 
+const runLongNoticeMs = 5 * 60 * 1000;
 let status: RunStatus = "idle";
 let currentRunId = 0;
-let activeSessionId = getOrCreateActiveSession(config.project.id).id;
+let activeProjectId = getActiveProjectId() ?? projects[0].id;
+if (!projectById.has(activeProjectId)) {
+  activeProjectId = projects[0].id;
+}
+setActiveProjectId(activeProjectId);
+let activeSessionId = getOrCreateActiveSession(activeProjectId).id;
 
 function now() {
   return new Date().toISOString();
+}
+
+function getActiveProject() {
+  return projectById.get(activeProjectId) ?? projects[0];
 }
 
 function send(socket: WebSocket, message: ServerMessage) {
@@ -79,9 +97,30 @@ function setStatus(nextStatus: RunStatus) {
   broadcast({ type: "status", status });
 }
 
+async function refreshProjects() {
+  const refreshedConfig = await loadConfig();
+  config = refreshedConfig;
+  projects = refreshedConfig.projects;
+  projectById = new Map(projects.map((project) => [project.id, project]));
+
+  for (const project of projects) {
+    ensureProject(project);
+  }
+
+  if (!projectById.has(activeProjectId)) {
+    activeProjectId = projects[0].id;
+    setActiveProjectId(activeProjectId);
+    const nextSession = getOrCreateActiveSession(activeProjectId);
+    activeSessionId = nextSession.id;
+    setActiveSessionId(nextSession.id);
+  }
+}
+
 function getSessionPayload(sessionId: string) {
   return {
-    sessions: listSessions(config.project.id),
+    projects,
+    activeProjectId,
+    sessions: listSessions(activeProjectId),
     activeSessionId: sessionId,
     messages: listMessages(sessionId)
   };
@@ -163,7 +202,7 @@ async function handleUserMessage(
   }
 
   const session = getSession(sessionId);
-  if (!session || session.projectId !== config.project.id) {
+  if (!session || session.projectId !== activeProjectId) {
     send(socket, {
       type: "error",
       sessionId,
@@ -193,6 +232,18 @@ async function handleUserMessage(
   const run = createRun(sessionId, permissionMode);
   let threadId = session.threadId;
   const pendingCommands: string[] = [];
+  const longRunTimer = setTimeout(() => {
+    if (runId !== currentRunId || status !== "running") {
+      return;
+    }
+
+    broadcast({
+      type: "local_notice",
+      sessionId,
+      message: "当前运行已经超过 5 分钟，可能只是任务较长；如果看起来卡住了，可以点停止。",
+      createdAt: now()
+    });
+  }, runLongNoticeMs);
 
   broadcast({ type: "user_message", sessionId, message, createdAt: now() });
   broadcast({ type: "sessions_updated", ...getSessionPayload(sessionId) });
@@ -200,9 +251,10 @@ async function handleUserMessage(
 
   try {
     console.log(`Starting Codex run (${threadId ? "resume" : "new"})`);
+    const project = getActiveProject();
     const exitCode = await runCodex({
       codexCommand,
-      projectPath: config.project.path,
+      projectPath: project.path,
       message,
       threadId,
       permissionMode,
@@ -239,6 +291,7 @@ async function handleUserMessage(
         }
       }
     });
+    clearTimeout(longRunTimer);
 
     if (runId !== currentRunId) {
       return;
@@ -253,7 +306,7 @@ async function handleUserMessage(
       });
     }
 
-    const summary = await collectGitSummary(config.project.path);
+    const summary = await collectGitSummary(project.path);
 
     if (runId !== currentRunId) {
       return;
@@ -285,6 +338,7 @@ async function handleUserMessage(
     broadcast({ type: "sessions_updated", ...getSessionPayload(sessionId) });
     setStatus("idle");
   } catch (error) {
+    clearTimeout(longRunTimer);
     if (runId !== currentRunId) {
       return;
     }
@@ -299,12 +353,21 @@ async function handleUserMessage(
 }
 
 wss.on("connection", (socket) => {
-  send(socket, {
-    type: "hello",
-    project: config.project,
-    ...getSessionPayload(activeSessionId),
-    status
-  });
+  void refreshProjects()
+    .catch((error) => {
+      send(socket, {
+        type: "error",
+        message: error instanceof Error ? error.message : String(error),
+        createdAt: now()
+      });
+    })
+    .finally(() => {
+      send(socket, {
+        type: "hello",
+        ...getSessionPayload(activeSessionId),
+        status
+      });
+    });
 
   socket.on("message", (data) => {
     let parsed: ClientMessage;
@@ -325,17 +388,75 @@ wss.on("connection", (socket) => {
       return;
     }
 
+    if (parsed.type === "refresh_projects") {
+      void refreshProjects()
+        .then(() => {
+          broadcast({ type: "sessions_updated", ...getSessionPayload(activeSessionId) });
+        })
+        .catch((error) => {
+          send(socket, {
+            type: "error",
+            message: error instanceof Error ? error.message : String(error),
+            createdAt: now()
+          });
+        });
+      return;
+    }
+
+    if (parsed.type === "select_project") {
+      void (async () => {
+        await refreshProjects();
+        if (!projectById.has(parsed.projectId)) {
+          send(socket, {
+            type: "error",
+            message: "项目不存在。",
+            createdAt: now()
+          });
+          return;
+        }
+
+        activeProjectId = parsed.projectId;
+        setActiveProjectId(activeProjectId);
+        const nextSession = getOrCreateActiveSession(activeProjectId);
+        activeSessionId = nextSession.id;
+        setActiveSessionId(nextSession.id);
+        broadcast({ type: "sessions_updated", ...getSessionPayload(nextSession.id) });
+        send(socket, {
+          type: "session_selected",
+          sessionId: nextSession.id,
+          projectId: activeProjectId,
+          messages: listMessages(nextSession.id)
+        });
+      })().catch((error) => {
+        send(socket, {
+          type: "error",
+          message: error instanceof Error ? error.message : String(error),
+          createdAt: now()
+        });
+      });
+      return;
+    }
+
     if (parsed.type === "create_session") {
-      const session = createSession(config.project.id);
-      activeSessionId = session.id;
-      broadcast({ type: "sessions_updated", ...getSessionPayload(session.id) });
-      send(socket, { type: "session_selected", sessionId: session.id, messages: [] });
+      void (async () => {
+        await refreshProjects();
+        const session = createSession(activeProjectId);
+        activeSessionId = session.id;
+        broadcast({ type: "sessions_updated", ...getSessionPayload(session.id) });
+        send(socket, { type: "session_selected", sessionId: session.id, projectId: activeProjectId, messages: [] });
+      })().catch((error) => {
+        send(socket, {
+          type: "error",
+          message: error instanceof Error ? error.message : String(error),
+          createdAt: now()
+        });
+      });
       return;
     }
 
     if (parsed.type === "select_session") {
       const session = getSession(parsed.sessionId);
-      if (!session || session.projectId !== config.project.id) {
+      if (!session || session.projectId !== activeProjectId) {
         send(socket, {
           type: "error",
           sessionId: parsed.sessionId,
@@ -348,7 +469,49 @@ wss.on("connection", (socket) => {
       activeSessionId = session.id;
       setActiveSessionId(session.id);
       broadcast({ type: "sessions_updated", ...getSessionPayload(session.id) });
-      send(socket, { type: "session_selected", sessionId: session.id, messages: listMessages(session.id) });
+      send(socket, {
+        type: "session_selected",
+        sessionId: session.id,
+        projectId: activeProjectId,
+        messages: listMessages(session.id)
+      });
+      return;
+    }
+
+    if (parsed.type === "rename_session") {
+      if (status === "running") {
+        send(socket, {
+          type: "error",
+          sessionId: parsed.sessionId,
+          message: "运行中不能重命名会话。",
+          createdAt: now()
+        });
+        return;
+      }
+
+      const session = getSession(parsed.sessionId);
+      if (!session || session.projectId !== activeProjectId) {
+        send(socket, {
+          type: "error",
+          sessionId: parsed.sessionId,
+          message: "会话不存在。",
+          createdAt: now()
+        });
+        return;
+      }
+
+      const renamed = renameSession(parsed.sessionId, parsed.title);
+      if (!renamed) {
+        send(socket, {
+          type: "error",
+          sessionId: parsed.sessionId,
+          message: "会话标题不能为空。",
+          createdAt: now()
+        });
+        return;
+      }
+
+      broadcast({ type: "sessions_updated", ...getSessionPayload(activeSessionId) });
       return;
     }
 
@@ -364,7 +527,7 @@ wss.on("connection", (socket) => {
       }
 
       const session = getSession(parsed.sessionId);
-      if (!session || session.projectId !== config.project.id) {
+      if (!session || session.projectId !== activeProjectId) {
         send(socket, {
           type: "error",
           sessionId: parsed.sessionId,
@@ -374,15 +537,25 @@ wss.on("connection", (socket) => {
         return;
       }
 
-      archiveSession(parsed.sessionId);
-      const nextSession = listSessions(config.project.id)[0] ?? createSession(config.project.id);
-      activeSessionId = nextSession.id;
-      setActiveSessionId(nextSession.id);
-      broadcast({ type: "sessions_updated", ...getSessionPayload(nextSession.id) });
-      send(socket, {
-        type: "session_selected",
-        sessionId: nextSession.id,
-        messages: listMessages(nextSession.id)
+      void (async () => {
+        await refreshProjects();
+        archiveSession(parsed.sessionId);
+        const nextSession = listSessions(activeProjectId)[0] ?? createSession(activeProjectId);
+        activeSessionId = nextSession.id;
+        setActiveSessionId(nextSession.id);
+        broadcast({ type: "sessions_updated", ...getSessionPayload(nextSession.id) });
+        send(socket, {
+          type: "session_selected",
+          sessionId: nextSession.id,
+          projectId: activeProjectId,
+          messages: listMessages(nextSession.id)
+        });
+      })().catch((error) => {
+        send(socket, {
+          type: "error",
+          message: error instanceof Error ? error.message : String(error),
+          createdAt: now()
+        });
       });
       return;
     }

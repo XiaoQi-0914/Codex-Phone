@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 
-const dataDir = path.resolve(process.cwd(), "data");
+const dataDir = path.resolve(process.env.CODEX_PHONE_DATA_DIR ?? path.resolve(process.cwd(), "data"));
 mkdirSync(dataDir, { recursive: true });
 
 export const db = new Database(path.join(dataDir, "codex-phone.db"));

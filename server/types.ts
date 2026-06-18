@@ -1,14 +1,16 @@
 export type AppConfig = {
   codexCommand?: string;
-  project: {
-    id: string;
-    name: string;
-    path: string;
-  };
+  projects: ProjectConfig[];
   server: {
     host: string;
     port: number;
   };
+};
+
+export type ProjectConfig = {
+  id: string;
+  name: string;
+  path: string;
 };
 
 export type ClientMessage =
@@ -22,8 +24,20 @@ export type ClientMessage =
       type: "create_session";
     }
   | {
+      type: "select_project";
+      projectId: string;
+    }
+  | {
+      type: "refresh_projects";
+    }
+  | {
       type: "select_session";
       sessionId: string;
+    }
+  | {
+      type: "rename_session";
+      sessionId: string;
+      title: string;
     }
   | {
       type: "delete_session";
@@ -39,7 +53,8 @@ export type ClientMessage =
 export type ServerMessage =
   | {
       type: "hello";
-      project: AppConfig["project"];
+      projects: ProjectConfig[];
+      activeProjectId: string;
       sessions: SessionSummary[];
       activeSessionId: string;
       messages: StoredDisplayMessage[];
@@ -47,12 +62,15 @@ export type ServerMessage =
     }
   | {
       type: "sessions_updated";
+      projects: ProjectConfig[];
+      activeProjectId: string;
       sessions: SessionSummary[];
       activeSessionId: string;
     }
   | {
       type: "session_selected";
       sessionId: string;
+      projectId: string;
       messages: StoredDisplayMessage[];
     }
   | {

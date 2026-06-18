@@ -30,7 +30,8 @@ type StoredDisplayMessage = {
 type ServerMessage =
   | {
       type: "hello";
-      project: Project;
+      projects: Project[];
+      activeProjectId: string;
       sessions: SessionSummary[];
       activeSessionId: string;
       messages: StoredDisplayMessage[];
@@ -38,12 +39,15 @@ type ServerMessage =
     }
   | {
       type: "sessions_updated";
+      projects: Project[];
+      activeProjectId: string;
       sessions: SessionSummary[];
       activeSessionId: string;
     }
   | {
       type: "session_selected";
       sessionId: string;
+      projectId: string;
       messages: StoredDisplayMessage[];
     }
   | {
@@ -319,7 +323,7 @@ function getEventItemType(event: unknown) {
   return typeof item?.type === "string" ? item.type : "";
 }
 
-function isQuietEvent(event: unknown) {
+function isIgnoredEvent(event: unknown) {
   if (!event || typeof event !== "object") {
     return false;
   }
@@ -331,6 +335,9 @@ function isQuietEvent(event: unknown) {
     type === "thread.started" ||
     type === "turn.started" ||
     type === "turn.completed" ||
+    type === "item.started" ||
+    type === "item.completed" ||
+    itemType === "mcp_tool_call" ||
     itemType === "web_search"
   );
 }
@@ -387,7 +394,7 @@ function serverMessageToDisplayMessages(message: ServerMessage): DisplayMessage[
       ];
     }
 
-    if (isQuietEvent(message.event)) {
+    if (isIgnoredEvent(message.event)) {
       return [];
     }
 
@@ -633,22 +640,55 @@ export default function App() {
   const [socket, setSocket] = useState<WebSocket | null>(null);
   const [connected, setConnected] = useState(false);
   const [status, setStatus] = useState<RunStatus>("idle");
-  const [project, setProject] = useState<Project | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [messagesBySession, setMessagesBySession] = useState<Record<string, ChatItem[]>>({});
   const [input, setInput] = useState("");
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("workspace-write");
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sessionFilter, setSessionFilter] = useState("");
+  const [connectionHint, setConnectionHint] = useState("正在连接电脑端服务...");
   const listRef = useRef<HTMLDivElement | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectDelayRef = useRef(2000);
+  const reconnectAllowedRef = useRef(true);
+  const socketRef = useRef<WebSocket | null>(null);
 
+  const activeProject = projects.find((item) => item.id === activeProjectId) ?? null;
+  const activeSession = sessions.find((session) => session.id === activeSessionId);
   const canSend = connected && status !== "running" && input.trim().length > 0;
   const items = activeSessionId ? (messagesBySession[activeSessionId] ?? []) : [];
+  const filteredSessions = useMemo(() => {
+    const query = sessionFilter.trim().toLowerCase();
+    const projectSessions = sessions;
+    if (!query) {
+      return projectSessions;
+    }
+
+    return projectSessions.filter((session) => session.title.toLowerCase().includes(query));
+  }, [sessionFilter, sessions]);
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
+
+  useEffect(() => {
+    socketRef.current = socket;
+  }, [socket]);
+
+  useEffect(() => {
+    reconnectAllowedRef.current = true;
+    return () => {
+      reconnectAllowedRef.current = false;
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+    };
+  }, []);
 
   function appendDisplayMessage(sessionId: string | undefined, message: DisplayMessage) {
     if (!sessionId) {
@@ -675,17 +715,50 @@ export default function App() {
     }));
   }
 
-  useEffect(() => {
+  function clearReconnectTimer() {
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+  }
+
+  function scheduleReconnect() {
+    if (!reconnectAllowedRef.current || reconnectTimerRef.current !== null) {
+      return;
+    }
+
+    setConnectionHint("连接已断开，正在重连...");
+    reconnectTimerRef.current = window.setTimeout(() => {
+      reconnectTimerRef.current = null;
+      connectSocket();
+    }, reconnectDelayRef.current);
+  }
+
+  function connectSocket() {
+    if (!reconnectAllowedRef.current) {
+      return;
+    }
+
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      return;
+    }
+
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
+    socketRef.current = ws;
+    setSocket(ws);
 
     ws.addEventListener("open", () => {
+      clearReconnectTimer();
+      reconnectDelayRef.current = 2000;
       setConnected(true);
+      setConnectionHint("已连接电脑端服务。");
     });
 
     ws.addEventListener("close", () => {
       setConnected(false);
       setSocket(null);
+      socketRef.current = null;
       const sessionId = activeSessionIdRef.current ?? undefined;
       appendDisplayMessage(sessionId, {
         type: "display_notice",
@@ -693,9 +766,15 @@ export default function App() {
         text: "连接已断开。请确认电脑端服务仍在运行，然后刷新页面。",
         createdAt: new Date().toISOString()
       });
+
+      if (reconnectAllowedRef.current) {
+        scheduleReconnect();
+      }
     });
 
     ws.addEventListener("error", () => {
+      setConnected(false);
+      setConnectionHint("连接失败，正在重试...");
       const sessionId = activeSessionIdRef.current ?? undefined;
       appendDisplayMessage(sessionId, {
         type: "display_notice",
@@ -703,6 +782,9 @@ export default function App() {
         text: "连接失败。请检查地址、网络和 Windows 防火墙。",
         createdAt: new Date().toISOString()
       });
+      if (reconnectAllowedRef.current) {
+        scheduleReconnect();
+      }
     });
 
     ws.addEventListener("message", (event) => {
@@ -722,15 +804,21 @@ export default function App() {
       }
 
       if (parsed.type === "hello") {
-        setProject(parsed.project);
+        clearReconnectTimer();
+        reconnectDelayRef.current = 2000;
+        setProjects(parsed.projects);
+        setActiveProjectId(parsed.activeProjectId);
         setSessions(parsed.sessions);
         setActiveSessionId(parsed.activeSessionId);
         setSessionMessages(parsed.activeSessionId, parsed.messages);
         setStatus(parsed.status);
+        setConnectionHint(parsed.status === "running" ? "当前任务正在运行。" : "已连接电脑端服务。");
         return;
       }
 
       if (parsed.type === "sessions_updated") {
+        setProjects(parsed.projects);
+        setActiveProjectId(parsed.activeProjectId);
         setSessions(parsed.sessions);
         setActiveSessionId(parsed.activeSessionId);
         return;
@@ -744,6 +832,7 @@ export default function App() {
 
       if (parsed.type === "status") {
         setStatus(parsed.status);
+        setConnectionHint(parsed.status === "running" ? "当前任务正在运行。" : "已连接电脑端服务。");
         return;
       }
 
@@ -751,14 +840,23 @@ export default function App() {
         return;
       }
 
+      if (parsed.type === "local_notice" && parsed.message.includes("超过 5 分钟")) {
+        setConnectionHint(parsed.message);
+      }
+
       appendServerMessage(parsed);
     });
+  }
 
-    setSocket(ws);
+  useEffect(() => {
+    connectSocket();
 
     return () => {
-      ws.close();
+      reconnectAllowedRef.current = false;
+      clearReconnectTimer();
+      socketRef.current?.close();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -783,6 +881,15 @@ export default function App() {
 
     return "空闲";
   }, [connected, status]);
+
+  const statusSummary = useMemo(() => {
+    const projectName = activeProject?.name ?? "未选择项目";
+    const sessionTitle = activeSession?.title ?? "未选择会话";
+    const connectionText = connected ? (status === "running" ? "运行中" : "已连接") : "断线重连中";
+    const latestNote = connectionHint;
+
+    return `${projectName} · ${sessionTitle} · ${connectionText} · ${latestNote}`;
+  }, [activeProject?.name, activeSession?.title, connected, connectionHint, status]);
 
   const renderItems = useMemo(() => buildRenderItems(items), [items]);
 
@@ -854,6 +961,48 @@ export default function App() {
     setSidebarOpen(false);
   }
 
+  function renameActiveSession() {
+    if (!socket || socket.readyState !== WebSocket.OPEN || status === "running" || !activeSessionId) {
+      return;
+    }
+
+    const activeSession = sessions.find((session) => session.id === activeSessionId);
+    const nextTitle = window.prompt("输入新的会话标题", activeSession?.title ?? "")?.trim();
+    if (!nextTitle || nextTitle === activeSession?.title) {
+      return;
+    }
+
+    socket.send(
+      JSON.stringify({
+        type: "rename_session",
+        sessionId: activeSessionId,
+        title: nextTitle
+      })
+    );
+  }
+
+  function refreshProjects() {
+    if (!socket || socket.readyState !== WebSocket.OPEN || status === "running") {
+      return;
+    }
+
+    socket.send(JSON.stringify({ type: "refresh_projects" }));
+  }
+
+  function openSidebar() {
+    setSidebarOpen(true);
+    refreshProjects();
+  }
+
+  function selectProject(projectId: string) {
+    if (!socket || socket.readyState !== WebSocket.OPEN || status === "running" || projectId === activeProjectId) {
+      return;
+    }
+
+    socket.send(JSON.stringify({ type: "select_project", projectId }));
+    setSidebarOpen(false);
+  }
+
   function selectSession(sessionId: string) {
     if (!socket || socket.readyState !== WebSocket.OPEN || status === "running" || sessionId === activeSessionId) {
       return;
@@ -877,35 +1026,75 @@ export default function App() {
     socket.send(JSON.stringify({ type: "delete_session", sessionId: activeSessionId }));
   }
 
-  const activeSession = sessions.find((session) => session.id === activeSessionId);
-
   return (
     <main className="shell">
       <header className="topbar">
-        <button type="button" className="sidebar-toggle" onClick={() => setSidebarOpen(true)}>
+        <button type="button" className="sidebar-toggle" onClick={openSidebar}>
           会话
         </button>
         <div className="topbar-title">
           <h1>Codex Phone</h1>
-          <p>{activeSession ? activeSession.title : project ? project.name : "等待连接电脑端服务"}</p>
+          <p>
+            {activeProject
+              ? `${activeProject.name}${activeSession ? ` · ${activeSession.title}` : ""}`
+              : "等待连接电脑端服务"}
+          </p>
         </div>
         <span className={`status status-${connected ? status : "disconnected"}`}>{statusText}</span>
       </header>
 
+      <section className="status-strip" aria-label="当前状态">
+        <div className="status-strip-main">{statusSummary}</div>
+        <div className="status-strip-sub">{connectionHint}</div>
+      </section>
+
       {sidebarOpen ? <button type="button" className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} /> : null}
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`} aria-hidden={!sidebarOpen}>
         <div className="sidebar-header">
-          <div>
-            <h2>{project?.name ?? "项目"}</h2>
-            <p>{project?.path ?? "等待连接"}</p>
+          <div className="sidebar-header-text">
+            <h2 title={activeProject?.name ?? "项目"}>{activeProject?.name ?? "项目"}</h2>
+            <p title={activeProject?.path ?? "等待连接"}>{activeProject?.path ?? "等待连接"}</p>
           </div>
           <button type="button" onClick={() => setSidebarOpen(false)}>
             关闭
           </button>
         </div>
+        <div className="sidebar-projects">
+          <label>
+            项目
+            <select
+              value={activeProjectId ?? ""}
+              onChange={(event) => selectProject(event.target.value)}
+              disabled={!connected || status === "running"}
+            >
+              {projects.map((project) => (
+                <option key={project.id} value={project.id}>
+                  {project.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <div className="sidebar-search">
+          <label>
+            搜索会话
+            <input
+              value={sessionFilter}
+              onChange={(event) => setSessionFilter(event.target.value)}
+              placeholder="输入标题关键字"
+            />
+          </label>
+        </div>
         <div className="sidebar-actions">
           <button type="button" onClick={createSession} disabled={!connected || status === "running"}>
             新会话
+          </button>
+          <button
+            type="button"
+            onClick={renameActiveSession}
+            disabled={!connected || status === "running" || !activeSessionId}
+          >
+            重命名
           </button>
           <button
             type="button"
@@ -917,7 +1106,7 @@ export default function App() {
           </button>
         </div>
         <div className="session-list">
-          {sessions.map((session) => (
+          {filteredSessions.map((session) => (
             <button
               type="button"
               className={`session-item ${session.id === activeSessionId ? "session-item-active" : ""}`}
